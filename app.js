@@ -248,21 +248,39 @@ let stop = code => {
         })
     );
 
+    // The close() calls above synchronously stop the master from accepting new SMTP
+    // connections. Now notify sender and receiver children over the fork IPC channel so
+    // they drain in-flight work before the queue server is torn down.
+    sendingZone.closeSenders();
+    smtpInterfaces.forEach(smtpInterface => smtpInterface.closeChildren());
+
     apiServer.close(() => {
         // wait until all connections to the API HTTP are closed
         log.info('API', 'Service closed');
         checkClosed();
     });
 
-    queueServer.close(() => {
-        // wait until all connections to the API HTTP are closed
-        log.info('QS', 'Service closed');
-        checkClosed();
-    });
-    queue.stop();
+    // Server.close() (lib/transport/server.js) does not just stop listening -- it immediately
+    // force-closes every currently connected child socket. Closing the queue server (and the
+    // Mongo connection behind it via queue.stop()) before a notified child has actually exited
+    // would cut off its only channel back to the queue mid-delivery, so it can never report the
+    // outcome and hangs forever instead of exiting. Wait for every child to close on its own
+    // first; the forceExitTimer below is still the hard ceiling if one never does.
+    let closeQueueServer = () => {
+        if (sendingZone.countChildren() || smtpInterfaces.some(smtpInterface => smtpInterface.children.size)) {
+            return setTimeout(closeQueueServer, 100).unref();
+        }
+        queueServer.close(() => {
+            log.info('QS', 'Service closed');
+            checkClosed();
+        });
+        queue.stop();
+    };
+    closeQueueServer();
 
-    // If we were not able to stop other stuff by 10 sec. force close
-    let forceExitTimer = setTimeout(() => forceStop(code), 10 * 1000);
+    // If we were not able to stop other stuff in time, force close. This is the ceiling for
+    // the entire shutdown, including waiting for the sender and receiver children to drain.
+    let forceExitTimer = setTimeout(() => forceStop(code), config.shutdownTimeout || 10 * 1000);
     forceExitTimer.unref();
 };
 
