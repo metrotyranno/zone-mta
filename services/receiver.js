@@ -185,6 +185,14 @@ process.on('message', (m, socket) => {
             return;
         }
 
+        // Guard the socket until smtp-server takes it over. A reset peer emits an
+        // asynchronous 'error'; during the initialization retry loop below (and the
+        // '421 Process not yet initialized' write) the socket has no 'error' listener yet,
+        // so an unhandled 'error' would crash the worker process.
+        socket.on('error', () => {
+            // ignore — smtp-server attaches its own handlers once it owns the socket
+        });
+
         let passSocket = () =>
             smtpServer.server._handleProxy(socket, (proxyErr, socketOptions) => {
                 smtpServer.server.connect(socket, socketOptions);
